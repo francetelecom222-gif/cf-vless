@@ -1,197 +1,52 @@
+const userID = 'b3f7a2c1-d4e8-4f90-bc12-8a3d5e6f7b9c';
+const proxyIP = 'cdn.xn--b6gac.eu.org';
+
 import { connect } from 'cloudflare:sockets';
 
-const CONFIG = {
-  UUID: 'd2cb8181-233c-4d18-9972-8a1b04db1155',
-  PATH: '/persadem',
-  RETRY_LIMIT: 3,
-  RETRY_DELAY: 500,
-};
+export default { fetch: (r, e, c) => r.headers.get('Upgrade') == 'websocket' ? handleWs(r, c) : new Response('OK') };
 
-export default {
-  async fetch(request, env, ctx) {
-    try {
-      const url = new URL(request.url);
-      const upgrade = request.headers.get('Upgrade');
-
-      if (url.pathname === '/health') {
-        return new Response('OK', { status: 200 });
-      }
-
-      if (url.pathname !== CONFIG.PATH || upgrade !== 'websocket') {
-        return new Response('OK', { status: 200 });
-      }
-
-      return await handleVless(request, ctx);
-    } catch (err) {
-      return new Response('Internal Error', { status: 500 });
-    }
-  }
-};
-
-async function handleVless(request, ctx) {
-  const { 0: client, 1: server } = new WebSocketPair();
-  server.accept();
-
-  ctx.waitUntil(handleStream(server, request));
-
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-    headers: {
-      'Upgrade': 'websocket',
-      'Connection': 'Upgrade',
-      'X-Powered-By': 'CF-Worker',
-    }
-  });
+async function handleWs(request, ctx) {
+  const [c, s] = new WebSocketPair();
+  s.accept();
+  ctx.waitUntil(vlessFlow(s));
+  return new Response(null, { status: 101, webSocket: c });
 }
 
-async function handleStream(ws, request) {
-  let remoteSocket = null;
-  let initialized = false;
-  let pendingBuffer = [];
-  let isClosing = false;
-
-  const safeClose = (code = 1000, reason = 'Done') => {
-    if (!isClosing) {
-      isClosing = true;
-      try { ws.close(code, reason); } catch (_) {}
-      try { remoteSocket?.close(); } catch (_) {}
-    }
-  };
-
-  const writeToRemote = async (socket, data) => {
-    try {
-      const writer = socket.writable.getWriter();
-      await writer.write(data instanceof Uint8Array ? data : new Uint8Array(data));
-      writer.releaseLock();
-      return true;
-    } catch (_) {
-      return false;
-    }
-  };
-
-  const connectWithRetry = async (host, port, retries = CONFIG.RETRY_LIMIT) => {
-    for (let i = 0; i < retries; i++) {
-      try {
-        const sock = connect({ hostname: host, port });
-        // Test connection
-        await Promise.race([
-          sock.opened,
-          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-        ]);
-        return sock;
-      } catch (err) {
-        if (i < retries - 1) {
-          await new Promise(r => setTimeout(r, CONFIG.RETRY_DELAY * (i + 1)));
-        }
-      }
-    }
-    return null;
-  };
+async function vlessFlow(ws) {
+  let socket = null, buf = [], ready = false;
 
   ws.addEventListener('message', async ({ data }) => {
-    if (isClosing) return;
-
-    try {
-      const raw = data instanceof ArrayBuffer ? data : await new Response(data).arrayBuffer();
-
-      if (!initialized) {
-        initialized = true;
-
-        const bytes = new Uint8Array(raw);
-        const version = bytes[0];
-        const uuid = parseUUID(bytes.slice(1, 17));
-
-        if (uuid.toLowerCase() !== CONFIG.UUID.toLowerCase()) {
-          safeClose(1003, 'Forbidden');
-          return;
-        }
-
-        const optLen = bytes[17];
-        const portIdx = 19 + optLen;
-        const port = (bytes[portIdx] << 8) | bytes[portIdx + 1];
-        const addrType = bytes[portIdx + 2];
-
-        let host = '';
-        let addrSize = 0;
-
-        if (addrType === 1) {
-          // IPv4
-          host = Array.from(bytes.slice(portIdx + 3, portIdx + 7)).join('.');
-          addrSize = 4;
-        } else if (addrType === 2) {
-          // Domain
-          addrSize = bytes[portIdx + 3];
-          host = new TextDecoder().decode(bytes.slice(portIdx + 4, portIdx + 4 + addrSize));
-          addrSize += 1;
-        } else if (addrType === 3) {
-          // IPv6
-          const ipv6Bytes = bytes.slice(portIdx + 3, portIdx + 19);
-          host = Array.from({ length: 8 }, (_, i) =>
-            ((ipv6Bytes[i * 2] << 8) | ipv6Bytes[i * 2 + 1]).toString(16)
-          ).join(':');
-          addrSize = 16;
-        } else {
-          safeClose(1002, 'Invalid address type');
-          return;
-        }
-
-        const bodyOffset = portIdx + 3 + addrSize;
-        const body = raw.slice(bodyOffset);
-
-        // Connect with retry
-        remoteSocket = await connectWithRetry(host, port);
-        if (!remoteSocket) {
-          safeClose(1011, 'Connection failed');
-          return;
-        }
-
-        // VLESS response
-        ws.send(new Uint8Array([version, 0]));
-
-        // Send body
-        if (body.byteLength > 0) {
-          await writeToRemote(remoteSocket, new Uint8Array(body));
-        }
-
-        // Send buffered
-        for (const chunk of pendingBuffer) {
-          await writeToRemote(remoteSocket, chunk);
-        }
-        pendingBuffer = [];
-
-        // Remote → Client pipe
-        remoteSocket.readable
-          .pipeTo(new WritableStream({
-            write(chunk) {
-              if (!isClosing && ws.readyState === WebSocket.READY_STATE_OPEN) {
-                try { ws.send(chunk); } catch (_) { safeClose(1011, 'Send error'); }
-              }
-            },
-            close() { safeClose(1000, 'Remote closed'); },
-            abort(err) { safeClose(1011, 'Remote aborted'); }
-          }))
-          .catch(() => safeClose(1011, 'Pipe error'));
-
-      } else {
-        // Forward to remote
-        if (remoteSocket) {
-          const ok = await writeToRemote(remoteSocket, new Uint8Array(raw));
-          if (!ok) safeClose(1011, 'Write failed');
-        } else {
-          pendingBuffer.push(new Uint8Array(raw));
-        }
-      }
-    } catch (err) {
-      safeClose(1011, 'Message error');
+    const raw = data instanceof ArrayBuffer ? data : await new Response(data).arrayBuffer();
+    if (!ready) {
+      ready = true;
+      const b = new Uint8Array(raw);
+      const uuid = [...b.slice(1,17)].map(x=>x.toString(16).padStart(2,'0')).join('').replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/,'$1-$2-$3-$4-$5');
+      if (uuid !== userID) { ws.close(1003,'x'); return; }
+      const opt = b[17], pi = 19+opt;
+      const port = b[pi]*256+b[pi+1], atype = b[pi+2];
+      let host='', al=0;
+      if (atype===1){ host=b.slice(pi+3,pi+7).join('.'); al=4; }
+      else if(atype===2){ al=b[pi+3]; host=new TextDecoder().decode(b.slice(pi+4,pi+4+al)); al++; }
+      else if(atype===3){ al=16; const v=b.slice(pi+3,pi+19); host=Array.from({length:8},(_,i)=>((v[i*2]<<8|v[i*2+1]).toString(16))).join(':'); }
+      const body = raw.slice(pi+3+al);
+      socket = connect({ hostname: proxyIP, port });
+      await socket.opened.catch(()=>{});
+      ws.send(new Uint8Array([b[0],0]));
+      const w = socket.writable.getWriter();
+      if (body.byteLength) await w.write(new Uint8Array(body));
+      for(const c of buf) await w.write(c);
+      buf=[];
+      w.releaseLock();
+      socket.readable.pipeTo(new WritableStream({
+        write: v => ws.readyState===1 && ws.send(v),
+        close: () => ws.close(1000,'done'),
+        abort: () => ws.close(1011,'err')
+      })).catch(()=>ws.close(1011,'pipe'));
+    } else {
+      if(socket){ const w=socket.writable.getWriter(); await w.write(new Uint8Array(raw)); w.releaseLock(); }
+      else buf.push(new Uint8Array(raw));
     }
   });
-
-  ws.addEventListener('close', () => safeClose(1000, 'Client closed'));
-  ws.addEventListener('error', () => safeClose(1011, 'WS error'));
-}
-
-function parseUUID(bytes) {
-  const h = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+  ws.addEventListener('close',()=>socket?.close?.());
+  ws.addEventListener('error',()=>socket?.close?.());
 }
